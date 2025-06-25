@@ -5,6 +5,10 @@ import os
 
 # Get path to database
 def get_db_connection():
+    """
+    Keep this function for backwards compatibility with standalone scripts
+    But API routes will use the Flask g object version
+    """
     db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "bitcraft.db"))
     return sqlite3.connect(db_path)
 
@@ -129,8 +133,24 @@ def get_required_materials(item_name, quantity=1, conn=None):
 
     return dict(total_materials)
 
-# Build full crafting tree (nested)
-def get_full_tree(item_name, quantity=1, conn=None):
+def get_full_tree(item_name, quantity=1, conn=None, visited=None):
+    """
+    Enhanced tree building with cycle detection and better error handling
+    """
+    if visited is None:
+        visited = set()
+    
+    # Cycle detection
+    if item_name in visited:
+        return {
+            "quantity": quantity,
+            "produced_by": None,
+            "ingredients": {},
+            "error": f"Circular dependency detected for {item_name}"
+        }
+    
+    visited.add(item_name)
+    
     internal = False
     if conn is None:
         conn = get_db_connection()
@@ -138,54 +158,93 @@ def get_full_tree(item_name, quantity=1, conn=None):
 
     cursor = conn.cursor()
 
-    # Look up the recipe
-    cursor.execute('SELECT RecipeID, OutputQty FROM Recipes WHERE OutputItem = ?', (item_name,))
-    recipe_row = cursor.fetchone()
+    try:
+        # Look up the recipe
+        cursor.execute('SELECT RecipeID, OutputQty FROM Recipes WHERE OutputItem = ?', (item_name,))
+        recipe_row = cursor.fetchone()
 
-    if not recipe_row:
-        # Base material
-        node = {
+        if not recipe_row:
+            # Base material
+            node = {
+                "quantity": quantity,
+                "produced_by": None,
+                "ingredients": {},
+                "is_base_material": True
+            }
+            visited.remove(item_name)
+            if internal:
+                conn.close()
+            return node
+
+        recipe_id, output_qty = recipe_row
+        
+        # Calculate how many times we need to run the recipe
+        multiplier = math.ceil(quantity / output_qty)
+        actual_output = multiplier * output_qty
+
+        # Get all ingredients for the recipe
+        cursor.execute('SELECT InputItem, Quantity FROM Ingredients WHERE RecipeID = ?', (recipe_id,))
+        ingredients = cursor.fetchall()
+
+        # Recursively build subtrees
+        tree = {
             "quantity": quantity,
-            "produced_by": None,
-            "ingredients": {}
+            "actual_output": actual_output,
+            "recipe_runs": multiplier,
+            "produced_by": item_name,
+            "ingredients": {},
+            "is_base_material": False
         }
+
+        for input_item, qty in ingredients:
+            total_qty = qty * multiplier
+            tree["ingredients"][input_item] = get_full_tree(
+                input_item, total_qty, conn, visited.copy()
+            )
+
+        visited.remove(item_name)
         if internal:
             conn.close()
-        return node
 
-    recipe_id, output_qty = recipe_row
-    multiplier = math.ceil(quantity / output_qty)
+        return tree
+        
+    except Exception as e:
+        visited.remove(item_name)
+        if internal:
+            conn.close()
+        return {
+            "quantity": quantity,
+            "produced_by": None,
+            "ingredients": {},
+            "error": f"Error processing {item_name}: {str(e)}"
+        }
 
-    # Get all ingredients for the recipe
-    cursor.execute('SELECT InputItem, Quantity FROM Ingredients WHERE RecipeID = ?', (recipe_id,))
-    ingredients = cursor.fetchall()
-
-    # Recursively build subtrees
-    tree = {
-        "quantity": quantity,
-        "produced_by": item_name,
-        "ingredients": {}
-    }
-
-    for input_item, qty in ingredients:
-        total_qty = qty * multiplier
-        tree["ingredients"][input_item] = get_full_tree(input_item, total_qty, conn)
-
-    if internal:
-        conn.close()
-
-    return tree
-
-# Flatten tree to a shopping list (base materials only)
-def flatten_tree_to_shopping_list(tree):
+# REPLACE flatten_tree_to_shopping_list with this enhanced version:
+def flatten_tree_to_shopping_list(tree, item_name="root"):
+    """
+    Enhanced shopping list with error reporting
+    """
     shopping_list = defaultdict(int)
+    errors = []
 
-    def walk(node, item_name):
-        if not node["ingredients"]:
-            shopping_list[item_name] += node["quantity"]
+    def walk(node, current_item):
+        if "error" in node:
+            errors.append(f"{current_item}: {node['error']}")
+            return
+            
+        if not node.get("ingredients") or node.get("is_base_material", False):
+            shopping_list[current_item] += node["quantity"]
         else:
             for child_item, child_node in node["ingredients"].items():
                 walk(child_node, child_item)
 
-    walk(tree, list(tree.get("ingredients", {}).keys())[0] if tree.get("ingredients") else "")
-    return dict(shopping_list)
+    walk(tree, item_name)
+    
+    # For backwards compatibility, return just the shopping list if no errors
+    if not errors:
+        return dict(shopping_list)
+    
+    return {
+        "shopping_list": dict(shopping_list),
+        "errors": errors
+    }
